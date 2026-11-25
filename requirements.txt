@@ -1,0 +1,3 @@
+requests>=2.31
+requests[socks]>=2.31
+idna>=3.6

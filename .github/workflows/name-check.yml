@@ -1,0 +1,125 @@
+name: 🔎 Name Availability Check
+
+on:
+  workflow_dispatch:
+    inputs:
+      fa_name:
+        description: "نام فارسی (برای دامنه فارسی) — مثال: علی رضایی"
+        required: false
+        type: string
+      en_name:
+        description: "نام انگلیسی (برای دامنه و یوزرنیم‌ها) — مثال: ali rezaei"
+        required: false
+        type: string
+      tlds:
+        description: "پسوندهای دامنه (با کاما)"
+        required: false
+        default: "ir,ایران"
+        type: string
+      platforms:
+        description: "پلتفرم‌ها: domain,instagram,x,telegram,bale"
+        required: false
+        default: "domain,instagram,x,telegram,bale"
+        type: string
+      variants:
+        description: "بررسی حالت‌های جایگزین (name_ir, thename, ...)"
+        required: false
+        default: false
+        type: boolean
+      fragment:
+        description: "بررسی Fragment برای یوزرنیم تلگرام"
+        required: false
+        default: true
+        type: boolean
+
+  # برای اجرا از طریق API:
+  # curl -X POST -H "Authorization: Bearer $TOKEN" \
+  #   https://api.github.com/repos/OWNER/REPO/dispatches \
+  #   -d '{"event_type":"name-check","client_payload":{"fa_name":"علی رضایی","en_name":"ali rezaei"}}'
+  repository_dispatch:
+    types: [name-check]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: name-check-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check "${{ inputs.en_name || github.event.client_payload.en_name || inputs.fa_name || github.event.client_payload.fa_name }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: "1"
+      # ورودی‌ها از طریق env پاس داده می‌شوند (نه مستقیم داخل اسکریپت) تا جلوی Script Injection گرفته شود
+      FA_NAME:   ${{ inputs.fa_name   || github.event.client_payload.fa_name   || '' }}
+      EN_NAME:   ${{ inputs.en_name   || github.event.client_payload.en_name   || '' }}
+      TLDS:      ${{ inputs.tlds      || github.event.client_payload.tlds      || 'ir,ایران' }}
+      PLATFORMS: ${{ inputs.platforms || github.event.client_payload.platforms || 'domain,instagram,x,telegram,bale' }}
+      VARIANTS:  ${{ inputs.variants  || github.event.client_payload.variants  || false }}
+      FRAGMENT:  ${{ github.event_name == 'repository_dispatch' && (github.event.client_payload.fragment != false) || inputs.fragment }}
+      # اختیاری: اگر اینستاگرام IP دیتاسنتر گیت‌هاب را محدود کرد، یک Secret به نام PROXY_URL بسازید
+      PROXY_URL: ${{ secrets.PROXY_URL }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Validate input
+        run: |
+          if [ -z "${FA_NAME// }" ] && [ -z "${EN_NAME// }" ]; then
+            echo "::error::حداقل یکی از fa_name یا en_name باید وارد شود."
+            exit 1
+          fi
+
+      - name: Run name checker
+        run: |
+          args=(--no-input --tlds "$TLDS" --only "$PLATFORMS"
+                --workers 5 --delay 1.0 --timeout 15
+                --json results.json --csv results.csv
+                --markdown "$GITHUB_STEP_SUMMARY")
+          [ -n "$FA_NAME" ]   && args+=(--fa "$FA_NAME")
+          [ -n "$EN_NAME" ]   && args+=(--en "$EN_NAME")
+          [ "$VARIANTS" = "true" ] && args+=(--variants)
+          [ "$FRAGMENT" != "true" ] && args+=(--no-fragment)
+          [ -n "$PROXY_URL" ] && args+=(--proxy "$PROXY_URL")
+          python name_checker.py "${args[@]}"
+
+      - name: Annotate available names
+        if: always()
+        run: |
+          [ -f results.json ] || exit 0
+          python - <<'PY'
+          import json
+          rows = json.load(open("results.json", encoding="utf-8"))
+          free = [r for r in rows if r["status"] == "available"]
+          unknown = [r for r in rows if r["status"] == "unknown"]
+          for r in free:
+              print(f"::notice title=آزاد — {r['platform']}::{r['target']}")
+          if unknown:
+              print(f"::warning::{len(unknown)} مورد نامشخص ماند (محدودیت نرخ یا خطای شبکه). جزئیات در Summary.")
+          PY
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: name-check-results-${{ github.run_number }}
+          path: |
+            results.json
+            results.csv
+          if-no-files-found: ignore
+          retention-days: 30
